@@ -1,248 +1,104 @@
 """
-Simulated Annealing for Network Path Optimization
-"""
+Simulated Annealing ile yönlendirme.
 
-import random
-import numpy as np
-from typing import List, Tuple, Dict
-import networkx as nx
+Başlangıç çözümü: bant genişliği filtrelenmiş grafta en az atlamalı yol.
+Komşu çözüm: bir ara düğümü silmek, ortak komşuyla değiştirmek, yeni düğüm eklemek,
+rastgele bir düğüm üzerinden yeniden kurmak ya da iki ara düğümün yerini değiştirmek;
+ardından yol onarılır.
+Daha kötü bir çözüm exp(-Δ/T) olasılıkla kabul edilir; sıcaklık her adımda soğutulur.
+"""
 import math
+import random
+from typing import Dict, List, Tuple
+
+import networkx as nx
+
+from genetik_algoritma import repair_path
 
 
 class SimulatedAnnealing:
-    """Simulated Annealing for finding optimal paths in networks"""
-    
-    def __init__(self, graph: nx.Graph, source: int, destination: int,
-                 initial_temp: float = 1000.0, cooling_rate: float = 0.95,
-                 num_iterations: int = 50, iterations_per_temp: int = 5):
+    """Kaynak-hedef arasında en düşük ağırlıklı maliyetli yolu arar."""
+
+    def __init__(self, ortam, source: int, destination: int, istenen_bw: float,
+                 initial_temp: float = 10.0, cooling_rate: float = 0.95,
+                 num_iterations: int = 100, iterations_per_temp: int = 10):
         """
-        Initialize Simulated Annealing
-        
-        Args:
-            graph: Network graph
-            source: Source node
-            destination: Destination node
-            initial_temp: Initial temperature
-            cooling_rate: Temperature cooling rate
-            num_iterations: Number of temperature steps
-            iterations_per_temp: Number of iterations per temperature
+        ortam              : network_model.AgOrtami (maliyet hesabı için)
+        initial_temp       : başlangıç sıcaklığı (fitness birimiyle aynı ölçekte)
+        cooling_rate       : her sıcaklık adımında T = T * cooling_rate
+        num_iterations     : sıcaklık adımı sayısı
+        iterations_per_temp: her sıcaklıktaki deneme sayısı
         """
-        self.graph = graph
+        self.ortam = ortam
+        self.graph = ortam.filtrele(istenen_bw)
+        self.istenen_bw = istenen_bw
         self.source = source
         self.destination = destination
         self.initial_temp = initial_temp
         self.cooling_rate = cooling_rate
         self.num_iterations = num_iterations
         self.iterations_per_temp = iterations_per_temp
-        
-        self.weights = {'delay': 0.33, 'reliability': 0.33, 'resource': 0.34}
-        self.network_generator = None
-    
-    def set_weights(self, weights: Dict[str, float]):
-        """Set weights for multi-objective optimization"""
-        self.weights = weights
-    
-    def set_network_generator(self, network_generator):
-        """Set network generator for metric calculations"""
-        self.network_generator = network_generator
-    
-    def _calculate_cost(self, path: List[int]) -> float:
-        """Calculate cost of a path"""
-        if not self.network_generator:
-            return float('inf')
-        
-        return self.network_generator.calculate_total_cost(path, self.weights)
-    
-    def _get_initial_solution(self) -> List[int]:
-        """Get initial solution (shortest path)"""
-        try:
-            return nx.shortest_path(self.graph, self.source, self.destination)
-        except:
-            return [self.source, self.destination]
-    
+
+    def _cost(self, path: List[int]) -> float:
+        return self.ortam.yol_maliyeti_hesapla(path, self.istenen_bw)[0]
+
     def _get_neighbor(self, current_path: List[int]) -> List[int]:
-        """Generate a neighbor solution by modifying current path"""
-        if len(current_path) < 2:
-            return current_path[:]
-        
+        """Mevcut yolu rastgele bir değişiklikle bozup onarır."""
         new_path = current_path[:]
-        
-        # Choose a random modification
-        modification = random.randint(0, 3)
-        
-        if modification == 0 and len(new_path) > 2:
-            # Remove a random intermediate node
-            remove_idx = random.randint(1, len(new_path) - 2)
-            new_path.pop(remove_idx)
-        
-        elif modification == 1:
-            # Insert a random node
-            if len(new_path) >= 2:
-                insert_idx = random.randint(1, len(new_path))
-                prev_node = new_path[insert_idx - 1]
-                
-                # Get neighbors of previous node
-                neighbors = list(self.graph.neighbors(prev_node))
-                neighbors = [n for n in neighbors if n not in new_path[:insert_idx]]
-                
-                if neighbors:
-                    new_node = random.choice(neighbors)
-                    new_path.insert(insert_idx, new_node)
-        
-        elif modification == 2 and len(new_path) > 3:
-            # Replace a segment with shortest path
-            idx1 = random.randint(1, len(new_path) - 3)
-            idx2 = random.randint(idx1 + 2, len(new_path) - 1)
-            
-            try:
-                segment = nx.shortest_path(self.graph, new_path[idx1 - 1], 
-                                          new_path[idx2])
-                new_path = new_path[:idx1] + segment[1:]
-            except:
-                pass
-        
-        else:
-            # Swap two intermediate nodes
-            if len(new_path) > 3:
-                idx1 = random.randint(1, len(new_path) - 2)
-                idx2 = random.randint(1, len(new_path) - 2)
-                if idx1 != idx2:
-                    new_path[idx1], new_path[idx2] = new_path[idx2], new_path[idx1]
-        
-        # Repair the path to ensure connectivity
-        return self._repair_path(new_path)
-    
-    def _repair_path(self, path: List[int]) -> List[int]:
-        """Repair path to ensure it's valid and connected"""
-        if not path or len(path) < 2:
-            try:
-                return nx.shortest_path(self.graph, self.source, self.destination)
-            except:
-                return [self.source, self.destination]
-        
-        # Ensure correct start and end
-        if path[0] != self.source:
-            path.insert(0, self.source)
-        if path[-1] != self.destination:
-            path.append(self.destination)
-        
-        # Remove duplicates
-        seen = set()
-        unique = []
-        for node in path:
-            if node not in seen:
-                seen.add(node)
-                unique.append(node)
-        
-        # Ensure connectivity
-        repaired = [unique[0]]
-        
-        for i in range(1, len(unique)):
-            current = repaired[-1]
-            target = unique[i]
-            
-            if current == target:
-                continue
-            
-            # Check direct connection
-            if self.graph.has_edge(current, target):
-                repaired.append(target)
-            else:
-                # Find shortest path
-                try:
-                    bridge = nx.shortest_path(self.graph, current, target)
-                    repaired.extend(bridge[1:])
-                except:
-                    continue
-        
-        # Final check for destination
-        if repaired[-1] != self.destination:
-            try:
-                bridge = nx.shortest_path(self.graph, repaired[-1], self.destination)
-                repaired.extend(bridge[1:])
-            except:
-                try:
-                    return nx.shortest_path(self.graph, self.source, self.destination)
-                except:
-                    return [self.source, self.destination]
-        
-        return repaired
-    
-    def _acceptance_probability(self, current_cost: float, new_cost: float, 
-                                temperature: float) -> float:
-        """Calculate acceptance probability for worse solution"""
-        if new_cost < current_cost:
-            return 1.0
-        
-        if temperature <= 0:
-            return 0.0
-        
-        return math.exp(-(new_cost - current_cost) / temperature)
-    
+        move = random.randint(0, 4)
+
+        if move == 0 and len(new_path) > 2:
+            # Bir ara düğümü sil
+            new_path.pop(random.randint(1, len(new_path) - 2))
+        elif move == 4 and len(new_path) > 2:
+            # Bir ara düğümü, önceki ve sonraki düğümün ortak komşusuyla değiştir (yol geçerli kalır)
+            i = random.randint(1, len(new_path) - 2)
+            common = (set(self.graph.neighbors(new_path[i - 1])) & set(self.graph.neighbors(new_path[i + 1]))) - set(new_path)
+            if common:
+                new_path[i] = random.choice(sorted(common))
+        elif move == 1:
+            # Bir düğümden sonra onun komşularından birini ekle
+            idx = random.randint(1, len(new_path) - 1)
+            candidates = [n for n in self.graph.neighbors(new_path[idx - 1]) if n not in new_path]
+            if candidates:
+                new_path.insert(idx, random.choice(candidates))
+        elif move == 2 and len(new_path) > 3:
+            # Bir bölümü rastgele bir ara düğüm üzerinden yeniden kur
+            i = random.randint(1, len(new_path) - 2)
+            new_path = new_path[:i] + [random.choice(list(self.graph.nodes))] + new_path[i + 1:]
+        elif len(new_path) > 3:
+            # İki ara düğümün yerini değiştir
+            i, j = random.sample(range(1, len(new_path) - 1), 2)
+            new_path[i], new_path[j] = new_path[j], new_path[i]
+
+        repaired = repair_path(self.graph, new_path, self.source, self.destination)
+        return repaired if repaired else current_path[:]
+
     def optimize(self) -> Tuple[List[int], float, Dict]:
-        """
-        Run Simulated Annealing optimization
-        
-        Returns:
-            Tuple of (best_path, best_cost, statistics)
-        """
-        if not self.network_generator:
+        """(en_iyi_yol, en_iyi_maliyet, geçmiş) döndürür; geçerli yol yoksa ([], inf, {})."""
+        try:
+            current_path = nx.shortest_path(self.graph, self.source, self.destination)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
             return [], float('inf'), {}
-        
-        # Get initial solution
-        current_path = self._get_initial_solution()
-        current_cost = self._calculate_cost(current_path)
-        
-        best_path = current_path[:]
-        best_cost = current_cost
-        
+        current_cost = self._cost(current_path)
+        best_path, best_cost = current_path[:], current_cost
+
         temperature = self.initial_temp
-        
-        history = {
-            'best_cost': [],
-            'current_cost': [],
-            'temperature': [],
-            'acceptance_rate': []
-        }
-        
-        total_iterations = 0
-        accepted_moves = 0
-        
-        for iteration in range(self.num_iterations):
+        history = {'best_cost': [], 'current_cost': [], 'temperature': []}
+
+        for _ in range(self.num_iterations):
             for _ in range(self.iterations_per_temp):
-                # Generate neighbor
                 new_path = self._get_neighbor(current_path)
-                new_cost = self._calculate_cost(new_path)
-                
-                # Decide whether to accept new solution
-                acceptance_prob = self._acceptance_probability(current_cost, 
-                                                               new_cost, 
-                                                               temperature)
-                
-                if random.random() < acceptance_prob:
-                    current_path = new_path
-                    current_cost = new_cost
-                    accepted_moves += 1
-                    
-                    # Update best solution
+                new_cost = self._cost(new_path)
+                delta = new_cost - current_cost
+                if delta < 0 or random.random() < math.exp(-delta / temperature):
+                    current_path, current_cost = new_path, new_cost
                     if current_cost < best_cost:
-                        best_path = current_path[:]
-                        best_cost = current_cost
-                
-                total_iterations += 1
-            
-            # Cool down
+                        best_path, best_cost = current_path[:], current_cost
+
             temperature *= self.cooling_rate
-            
-            # Record statistics
             history['best_cost'].append(best_cost)
             history['current_cost'].append(current_cost)
             history['temperature'].append(temperature)
-            
-            if total_iterations > 0:
-                acceptance_rate = accepted_moves / total_iterations
-            else:
-                acceptance_rate = 0
-            history['acceptance_rate'].append(acceptance_rate)
-        
+
         return best_path, best_cost, history

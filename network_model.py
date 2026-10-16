@@ -1,260 +1,171 @@
-import networkx as nx  # Ağ topolojisini (Graf) oluşturmak ve düğüm/bağlantı ilişkilerini yönetmek için gerekli.
-import math  # PDF'teki Güvenilirlik hesabında -log (logaritma) işlemi yapmak için gerekli.
-import pandas as pd  # Verilen CSV dosyalarını (Node, Edge, Demand) okuyup tablo olarak işlemek için gerekli.
+"""
+Ağ modeli: CSV verilerinden topolojiyi kurar ve bir yolun çok amaçlı maliyetini hesaplar.
 
-# =============================================================================
-# AYARLAR VE SABİTLER
-# =============================================================================
-# Kodun tamamında kullanılacak dosya isimlerini burada sabitliyoruz (Değişiklik gerekirse tek yerden yapılır).
-DUGUM_DOSYASI = "BSM307_317_Guz2025_TermProject_NodeData.csv"  # Düğüm özelliklerini (işlem süresi, güvenilirlik) tutan dosya.
-KENAR_DOSYASI = "BSM307_317_Guz2025_TermProject_EdgeData.csv"  # Bağlantı özelliklerini (hız, gecikme, maliyet) tutan dosya.
-TALEP_DOSYASI = "BSM307_317_Guz2025_TermProject_DemandData.csv"  # Kimden kime ne kadar veri gideceğini belirten talep dosyası.
+Her yol için üç maliyet hesaplanır ve ağırlıklı toplamla tek bir uygunluk (fitness)
+değerine indirgenir (düşük = iyi):
+  - Gecikme      : bağlantı gecikmeleri + ara düğümlerin işlem süreleri (ms)
+  - Güvenilirlik : -log(güvenilirlik) toplamı (çarpımsal olasılık toplanabilir maliyete çevrilir)
+  - Kaynak       : her bağlantı için 1000 / kapasite (Mbps)
+İstenen bant genişliğini karşılamayan bir bağlantı içeren yol geçersizdir (sonsuz maliyet).
+"""
+import math
+import os
+
+import networkx as nx
+import pandas as pd
+
+VERI_KLASORU = os.path.dirname(os.path.abspath(__file__))
+DUGUM_DOSYASI = os.path.join(VERI_KLASORU, "BSM307_317_Guz2025_TermProject_NodeData.csv")
+KENAR_DOSYASI = os.path.join(VERI_KLASORU, "BSM307_317_Guz2025_TermProject_EdgeData.csv")
+TALEP_DOSYASI = os.path.join(VERI_KLASORU, "BSM307_317_Guz2025_TermProject_DemandData.csv")
+
+# Amaç ağırlıkları (toplamları 1). Varsayılan: üç amaca yaklaşık eşit önem.
+W_GECIKME = 0.33
+W_GUVENILIRLIK = 0.33
+W_KAYNAK = 0.34
 
 
 class AgOrtami:
-    """
-    Bu sınıf, hocanın verdiği CSV dosyalarından verileri okuyarak
-    gerçek ağ topolojisini oluşturur ve yönetir.
-    """
+    """CSV dosyalarından ağ topolojisini kurar ve yol maliyetlerini hesaplar."""
 
     def __init__(self):
-        # Boş bir graf oluşturuyoruz.
         self.graf = nx.Graph()
-
-        # Optimizasyon Ağırlıkları (Fitness Hesaplama Katsayıları)
-        # PDF'te "Toplamları 1 olmalı" kuralı vardır.
-        # Başlangıçta hepsine eşit önem vermek için (1/3) yaklaşık değerler girdik.
-        # Toplamın tam 1.00 olması için sonuncuyu 0.34 yaptık (0.33 + 0.33 + 0.34 = 1.0).
-        self.w_gecikme = 0.33  # Gecikme (Delay) önemi
-        self.w_guvenilirlik = 0.33  # Güvenilirlik (Reliability) önemi
-        self.w_kaynak = 0.34  # Kaynak (Bandwidth) maliyeti önemi
+        self.w_gecikme = W_GECIKME
+        self.w_guvenilirlik = W_GUVENILIRLIK
+        self.w_kaynak = W_KAYNAK
 
     def verileri_yukle_ve_agi_kur(self):
-        """
-        Bu fonksiyon CSV dosyalarını okur ve NetworkX grafiğine dönüştürür.
-        Rastgele üretim YERİNE bu fonksiyon kullanılır.
-        """
+        """Düğüm ve bağlantı verilerini okuyup NetworkX grafını oluşturur."""
         print("📂 Veriler okunuyor ve ağ oluşturuluyor...")
 
-        # ---------------------------------------------------------
-        # ADIM 1: DÜĞÜM (NODE) VERİLERİNİ YÜKLEME
-        # ---------------------------------------------------------
+        # CSV'lerde ayraç ';', ondalık ayracı ',' kullanılır
         try:
-            # Pandas kütüphanesi ile CSV dosyasını okuyup 'DataFrame' (akıllı tablo) formatına çeviriyoruz.
-            # Parametrelerin Anlamları:
-            # sep=';'      : Sütunların noktalı virgül ile ayrıldığını belirtir.
-            # decimal=','  : Sayılardaki ondalık ayracının virgül olduğunu belirtir.
             dugum_verisi = pd.read_csv(DUGUM_DOSYASI, sep=';', decimal=',')
-
-            # -------------------------------------------------------------------------
-            # DÖNGÜ BAŞLANGICI
-            # -------------------------------------------------------------------------
-            # .iterrows() : Tabloyu satır satır okumamızı sağlar.
-            for indeks, satir in dugum_verisi.iterrows():
-                # VERİYİ ÇEKME VE TEMİZLEME
-                # satir['node_id']: O satırdaki id'yi alır. int() ile tam sayıya çevrilir.
-                dugum_id = int(satir['node_id'])
-
-                # CSV'deki sütunları değişkenlere alıyoruz
-                islem_suresi = float(satir['s_ms'])  # İşlem süresi (milisaniye)
-                guvenilirlik = float(satir['r_node'])  # Düğüm güvenilirliği (0-1 arası)
-
-                # Düğümü grafa ekle ve özelliklerini kaydet
-                self.graf.add_node(dugum_id)
-                self.graf.nodes[dugum_id]['islem_suresi'] = islem_suresi
-                self.graf.nodes[dugum_id]['guvenilirlik'] = guvenilirlik
-
-                # Matematiksel Dönüşüm: Güvenilirlik çarpımsal olduğu için (-log) alarak
-                # toplamsal maliyete çeviriyoruz. Algoritma toplama yapabilsin diye.
-                self.graf.nodes[dugum_id]['guv_maliyeti'] = -math.log(guvenilirlik)
-
-            print(f"✅ {len(dugum_verisi)} adet düğüm başarıyla yüklendi.")
-
         except FileNotFoundError:
-            print(f"❌ HATA: '{DUGUM_DOSYASI}' dosyası bulunamadı! Lütfen dosya ismini kontrol et.")
-            return
+            print(f"❌ HATA: '{DUGUM_DOSYASI}' dosyası bulunamadı!")
+            return None
 
-        # ---------------------------------------------------------
-        # ADIM 2: KENAR (LINK) VERİLERİNİ YÜKLEME
-        # ---------------------------------------------------------
+        for _, satir in dugum_verisi.iterrows():
+            dugum_id = int(satir['node_id'])
+            guvenilirlik = float(satir['r_node'])
+            self.graf.add_node(
+                dugum_id,
+                islem_suresi=float(satir['s_ms']),         # düğümdeki işlem süresi (ms)
+                guvenilirlik=guvenilirlik,                  # 0-1 arası
+                guv_maliyeti=-math.log(guvenilirlik),
+            )
+        print(f"✅ {len(dugum_verisi)} adet düğüm yüklendi.")
+
         try:
             kenar_verisi = pd.read_csv(KENAR_DOSYASI, sep=';', decimal=',')
-
-            for indeks, satir in kenar_verisi.iterrows():
-                kaynak_dugum = int(satir['src'])  # Nereden (Source)
-                hedef_dugum = int(satir['dst'])  # Nereye (Destination)
-
-                # Özellikleri alıyoruz
-                kapasite = float(satir['capacity_mbps'])  # Bant genişliği
-                gecikme = float(satir['delay_ms'])  # Kablo gecikmesi
-                guvenilirlik = float(satir['r_link'])  # Hat güvenilirliği
-
-                # Bağlantıyı (Edge) grafa ekle
-                self.graf.add_edge(kaynak_dugum, hedef_dugum)
-
-                # Özellikleri kenara kaydet
-                self.graf[kaynak_dugum][hedef_dugum]['bant_genisligi'] = kapasite
-                self.graf[kaynak_dugum][hedef_dugum]['gecikme'] = gecikme
-                self.graf[kaynak_dugum][hedef_dugum]['guvenilirlik'] = guvenilirlik
-
-                # KAYNAK MALİYETİ HESABI (PDF Formülü)
-                # Formül: 1000 / Bant Genişliği
-                # Bant genişliği ne kadar yüksekse maliyet o kadar az olur.
-                self.graf[kaynak_dugum][hedef_dugum]['kaynak_maliyeti'] = 1000.0 / kapasite
-
-                # GÜVENİLİRLİK MALİYETİ HESABI (-log işlemi)
-                self.graf[kaynak_dugum][hedef_dugum]['guv_maliyeti'] = -math.log(guvenilirlik)
-
-            print(f"✅ {len(kenar_verisi)} adet bağlantı başarıyla yüklendi.")
-
         except FileNotFoundError:
             print(f"❌ HATA: '{KENAR_DOSYASI}' dosyası bulunamadı!")
-            return
+            return None
 
-        # ---------------------------------------------------------
-        # ADIM 3: AĞ KONTROLÜ
-        # ---------------------------------------------------------
+        for _, satir in kenar_verisi.iterrows():
+            kapasite = float(satir['capacity_mbps'])
+            guvenilirlik = float(satir['r_link'])
+            self.graf.add_edge(
+                int(satir['src']), int(satir['dst']),
+                bant_genisligi=kapasite,                    # Mbps
+                gecikme=float(satir['delay_ms']),           # ms
+                guvenilirlik=guvenilirlik,
+                kaynak_maliyeti=1000.0 / kapasite,          # yüksek kapasite = düşük maliyet
+                guv_maliyeti=-math.log(guvenilirlik),
+            )
+        print(f"✅ {len(kenar_verisi)} adet bağlantı yüklendi.")
+
         if nx.is_connected(self.graf):
-            print("Bilgi: Ağ sorunsuz oluşturuldu. Tüm düğümler birbirine erişebilir.")
+            print("Bilgi: Ağ bağlı; tüm düğümler birbirine erişebilir.")
         else:
-            print("UYARI: Ağ kopuk! Bazı düğümler arasında yol yok.")
-
+            print("UYARI: Ağ bağlı değil; bazı düğümler arasında yol yok.")
         return self.graf
 
     def talep_listesini_getir(self):
-        """
-        DemandData.csv dosyasındaki 'Kimden -> Kime ne kadar trafik lazım'
-        bilgisini okur ve liste olarak verir.
-        """
+        """Talep dosyasındaki (kaynak, hedef, istenen bant genişliği) kayıtlarını döndürür."""
         try:
             talep_verisi = pd.read_csv(TALEP_DOSYASI, sep=';', decimal=',')
-            talep_listesi = []
-
-            for indeks, satir in talep_verisi.iterrows():
-                # Her bir talep satırını sözlük (dictionary) yapıyoruz
-                talep = {
-                    'kaynak': int(satir['src']),
-                    'hedef': int(satir['dst']),
-                    'miktar': float(satir['demand_mbps'])
-                }
-                talep_listesi.append(talep)
-
-            return talep_listesi
-
         except FileNotFoundError:
             print(f"❌ HATA: '{TALEP_DOSYASI}' dosyası bulunamadı.")
             return []
+        return [
+            {'kaynak': int(s['src']), 'hedef': int(s['dst']), 'miktar': float(s['demand_mbps'])}
+            for _, s in talep_verisi.iterrows()
+        ]
 
-    # =========================================================================
-    # 🔥🔥🔥 GÜNCELLENEN KISIM BURASI (DEMAND KONTROLÜ EKLENDİ) 🔥🔥🔥
-    # =========================================================================
+    def filtrele(self, istenen_bw):
+        """Yalnızca istenen bant genişliğini karşılayan bağlantılardan oluşan alt graf (görünüm)."""
+        gecerli = [(u, v) for u, v, d in self.graf.edges(data=True) if d['bant_genisligi'] >= istenen_bw]
+        return self.graf.edge_subgraph(gecerli)
+
     def yol_maliyeti_hesapla(self, yol, istenen_bw=0):
         """
-        Verilen bir yolun (path) toplam maliyetini (Fitness) hesaplar.
+        Yolun ağırlıklı toplam maliyetini ve bileşenlerini döndürür:
+        (fitness, toplam_gecikme_ms, guvenilirlik_maliyeti, kaynak_maliyeti)
 
-        Parametreler:
-        - yol: [0, 5, 24] gibi düğüm listesi.
-        - istenen_bw: Bu yoldan geçirilmek istenen veri miktarı (Mbps).
-
-        YENİ ÖZELLİK: Eğer yolun kapasitesi 'istenen_bw'den düşükse
-        o yola SONSUZ CEZA (float('inf')) verir.
+        Yol geçersizse (2 düğümden kısa, bağlantı yok ya da kapasite yetersiz) maliyet sonsuzdur.
+        Güvenilirlik yüzdesine geri dönmek için: exp(-guvenilirlik_maliyeti) * 100
         """
+        sonsuz = float('inf')
         if not yol or len(yol) < 2:
-            return float('inf'), 0, 0, 0
+            return sonsuz, sonsuz, sonsuz, sonsuz
 
-        toplam_gecikme = 0
-        toplam_guv_maliyeti = 0
-        toplam_kaynak_maliyeti = 0
+        toplam_gecikme = 0.0
+        toplam_guv_maliyeti = 0.0
+        toplam_kaynak_maliyeti = 0.0
 
-        # --- A. YOL ÜZERİNDEKİ KENARLARIN (LINK) KONTROLÜ VE MALİYETİ ---
-        for i in range(len(yol) - 1):
-            u = yol[i]
-            v = yol[i + 1]
-            baglanti = self.graf[u][v]  # O iki düğüm arasındaki hat bilgisi
-
-            # 🛑 DEMAND (KAPASİTE) KONTROLÜ 🛑
-            # Eğer hattın mevcut kapasitesi (Bandwidth), bizim taşımak istediğimiz yükten AZ ise;
-            # Bu yol fiziksel olarak veriyi taşıyamaz.
+        for u, v in zip(yol, yol[1:]):
+            if not self.graf.has_edge(u, v):
+                return sonsuz, sonsuz, sonsuz, sonsuz
+            baglanti = self.graf[u][v]
             if baglanti['bant_genisligi'] < istenen_bw:
-                # Yolu geçersiz kılmak için SONSUZ maliyet döndür.
-                # Algoritma bu sayede "Bu yol imkansız, bunu seçme" der.
-                return float('inf'), float('inf'), float('inf'), float('inf')
-
-            # Kapasite yetiyorsa normal maliyetleri toplayarak devam et
+                return sonsuz, sonsuz, sonsuz, sonsuz
             toplam_gecikme += baglanti['gecikme']
             toplam_guv_maliyeti += baglanti['guv_maliyeti']
             toplam_kaynak_maliyeti += baglanti['kaynak_maliyeti']
 
-        # --- B. DÜĞÜMLERİN (NODE) KENDİ MALİYETLERİ ---
-        # 1. Güvenilirlik: Yol üzerindeki HER düğüm risk oluşturur, hepsi toplanır.
-        for dugum_id in yol:
-            toplam_guv_maliyeti += self.graf.nodes[dugum_id]['guv_maliyeti']
+        # Her düğüm güvenilirliği etkiler; işlem süresi yalnızca ara düğümlerde eklenir
+        for dugum in yol:
+            toplam_guv_maliyeti += self.graf.nodes[dugum]['guv_maliyeti']
+        for dugum in yol[1:-1]:
+            toplam_gecikme += self.graf.nodes[dugum]['islem_suresi']
 
-        # 2. İşlem Gecikmesi: Sadece ARADAKİ düğümlerde vakit kaybedilir.
-        # Kaynak (ilk) ve Hedef (son) düğümde işlem gecikmesi sayılmaz (PDF kuralı).
-        ara_dugumler = yol[1:-1]
-        for dugum_id in ara_dugumler:
-            toplam_gecikme += self.graf.nodes[dugum_id]['islem_suresi']
-
-        # --- C. GENEL SKOR (FITNESS) HESABI ---
-        # Ağırlıklı toplama yöntemi ile tek bir skor üretiyoruz.
-        genel_skor = (self.w_gecikme * toplam_gecikme) + \
-                     (self.w_guvenilirlik * toplam_guv_maliyeti) + \
-                     (self.w_kaynak * toplam_kaynak_maliyeti)
-
+        genel_skor = (self.w_gecikme * toplam_gecikme
+                      + self.w_guvenilirlik * toplam_guv_maliyeti
+                      + self.w_kaynak * toplam_kaynak_maliyeti)
         return genel_skor, toplam_gecikme, toplam_guv_maliyeti, toplam_kaynak_maliyeti
 
+    def optimum_yol(self, kaynak, hedef, istenen_bw):
+        """
+        Referans çözüm: kesin optimum yol.
 
-# =============================================================================
-# ÇALIŞTIRMA KISMI (MAIN)
-# =============================================================================
-if __name__ == "__main__":
-    print("\n--- PROJE BAŞLATILIYOR (DEMAND KONTROLLÜ MOD) ---")
+        Ağırlıklı toplam maliyet bağlantılar üzerinde toplanabilir olduğundan, her bağlantıya
+        (bağlantı maliyeti + girilen düğümün maliyeti) ağırlığı verilip bant genişliği
+        filtrelenmiş grafta Dijkstra çalıştırılırsa global optimum bulunur. Sezgisel
+        algoritmaların optimuma uzaklığı bu çözümle ölçülür.
+        """
+        graf = self.filtrele(istenen_bw)
 
-    # 1. Sınıfı oluştur
-    ag_yoneticisi = AgOrtami()
-
-    # 2. Dosyaları oku ve ağı kur
-    ag_yoneticisi.verileri_yukle_ve_agi_kur()
-
-    # 3. Talepleri oku
-    talepler = ag_yoneticisi.talep_listesini_getir()
-
-    if len(talepler) > 0:
-        # Örnek olarak listedeki İLK talebi alıp test edelim
-        ornek_talep = talepler[0]
-        src = ornek_talep['kaynak']
-        dst = ornek_talep['hedef']
-        bw = ornek_talep['miktar']
-
-        print(f"\n🧪 TEST: Talep Dosyasından İlk Kayıt Deneniyor...")
-        print(f"   Kaynak: {src} -> Hedef: {dst} | İstenen Hız: {bw} Mbps")
+        def agirlik(u, v, d):
+            gecikme = d['gecikme'] + (graf.nodes[v]['islem_suresi'] if v != hedef else 0.0)
+            guv = d['guv_maliyeti'] + graf.nodes[v]['guv_maliyeti']
+            return self.w_gecikme * gecikme + self.w_guvenilirlik * guv + self.w_kaynak * d['kaynak_maliyeti']
 
         try:
-            # Şimdilik en kısa yolu buluyoruz (Henüz Genetik Algoritma yok, test amaçlı)
-            bulunan_yol = nx.shortest_path(ag_yoneticisi.graf, src, dst)
-            print(f"   📍 Denenen Yol: {bulunan_yol}")
+            return nx.dijkstra_path(graf, kaynak, hedef, weight=agirlik)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
 
-            # 🔥 DİKKAT: Artık 'istenen_bw' parametresini de fonksiyona gönderiyoruz!
-            skor, gecikme, guv_maliyet, kaynak_maliyet = ag_yoneticisi.yol_maliyeti_hesapla(bulunan_yol, istenen_bw=bw)
 
-            # Eğer fonksiyon bize SONSUZ (inf) döndürdüyse, kapasite yetmemiş demektir.
-            if skor == float('inf'):
-                print("\n❌ SONUÇ: BU YOL BAŞARISIZ!")
-                print("   Sebep: Yol üzerindeki bir veya daha fazla bağlantının kapasitesi yetersiz.")
-                print("   Algoritma bu yolu 'Ceza Puanı' sebebiyle elemeli.")
-            else:
-                # Güvenilirliği tekrar yüzdeye çeviriyoruz (e üzeri -maliyet)
-                guvenilirlik_yuzde = math.exp(-guv_maliyet) * 100
-
-                print("\n✅ SONUÇ: BU YOL UYGUN!")
-                print(f"   1. Toplam Gecikme    : {gecikme:.2f} ms")
-                print(f"   2. Toplam Güvenilirlik: %{guvenilirlik_yuzde:.4f}")
-                print(f"   3. Kaynak Maliyeti   : {kaynak_maliyet:.2f}")
-                print(f"   --------------------------------------")
-                print(f"   ★ GENEL SKOR (Fitness): {skor:.4f} (Daha düşük daha iyi)")
-
-        except nx.NetworkXNoPath:
-            print("   ⚠️ Hata: Bu iki düğüm arasında fiziksel bir yol yok!")
-    else:
-        print("   ⚠️ Talep listesi boş geldi, dosya içeriğini kontrol edin.")
+if __name__ == "__main__":
+    ag = AgOrtami()
+    ag.verileri_yukle_ve_agi_kur()
+    talep = ag.talep_listesini_getir()[0]
+    yol = ag.optimum_yol(talep['kaynak'], talep['hedef'], talep['miktar'])
+    skor, gecikme, guv, kaynak = ag.yol_maliyeti_hesapla(yol, talep['miktar'])
+    print(f"\nTalep: {talep['kaynak']} -> {talep['hedef']} ({talep['miktar']} Mbps)")
+    print(f"Optimum yol   : {yol}")
+    print(f"Fitness       : {skor:.4f}")
+    print(f"Gecikme       : {gecikme:.2f} ms")
+    print(f"Güvenilirlik  : %{math.exp(-guv) * 100:.2f}")
+    print(f"Kaynak maliyeti: {kaynak:.2f}")
